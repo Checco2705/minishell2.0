@@ -1,0 +1,489 @@
+# **************************************************************************** #
+#                                                                              #
+#                                                         :::      ::::::::    #
+#    redirection.txt                                    :+:      :+:    :+:    #
+#                                                     +:+ +:+         +:+      #
+#    By: ffebbrar <ffebbrar@student.42.fr>          +#+  +:+       +#+         #
+#                                                 +#+#+#+#+#+   +#+            #
+#    Created: 2025/06/11 19:24:01 by ffebbrar          #+#    #+#              #
+#    Updated: 2025/07/04 23:55:47 by ffebbrar         ###   ########.fr        #
+#                                                                              #
+# **************************************************************************** #
+
+#include "minishell.h"
+#include <fcntl.h>  // Per i flag O_RDONLY, O_WRONLY, O_CREAT, O_APPEND, O_TRUNC
+#include <errno.h>  // Per errno
+
+/*
+** Chiude un file descriptor esistente se valido.
+*/
+static void	close_existing_fd(int *fd)
+{
+	if (*fd > 0)
+	{
+		if (close(*fd) == -1)
+			perror("minishell: close");
+		*fd = -1;
+	}
+}
+
+/*
+** Gestisce gli errori di apertura file e stampa messaggi appropriati.
+*/
+static void	handle_file_error(const char *filename)
+{
+	if (errno == ENOENT)
+	{
+		if (access(filename, F_OK) == -1)
+		{
+			ft_fprintf(2, "minishell: %s: File o directory non esistente\n",
+				filename);
+			return ;
+		}
+		ft_fprintf(2, "minishell: %s: Permesso negato\n", filename);
+	}
+	else
+		perror("minishell");
+	g_state.last_status = 1;
+}
+
+/*
+** Crea un nome file temporaneo unico
+*/
+static char	*create_temp_filename(void)
+{
+	static int	counter = 0;
+	char		*num_str;
+	char		*filename;
+	char		*temp;
+	char		*pid_str;
+
+	num_str = ft_itoa(counter++);
+	if (!num_str)
+		return (NULL);
+		
+	pid_str = ft_itoa(getpid());
+	if (!pid_str)
+	{
+		free(num_str);
+		return (NULL);
+	}
+	
+	temp = ft_strjoin("/tmp/heredoc_", num_str);
+	free(num_str);
+	if (!temp)
+	{
+		free(pid_str);
+		return (NULL);
+	}
+	
+	filename = ft_strjoin(temp, "_");
+	free(temp);
+	if (!filename)
+	{
+		free(pid_str);
+		return (NULL);
+	}
+	
+	temp = ft_strjoin(filename, pid_str);
+	free(filename);
+	free(pid_str);
+	
+	return (temp);
+}
+
+/*
+** Espande le variabili in una linea dell'heredoc se necessario
+*/
+static int	expand_heredoc_line(char *line, int fd, char *delimiter)
+{
+	char	*expanded;
+	
+	// Se il delimiter è quotato, non espandere le variabili
+	if (ft_strchr(delimiter, '\'') || ft_strchr(delimiter, '"'))
+	{
+		write(fd, line, ft_strlen(line));
+		write(fd, "\n", 1);
+		return (0);
+	}
+	
+	// Espandi le variabili nella linea
+	expanded = expand_string(line);
+	if (!expanded)
+		return (-1);
+	
+	write(fd, expanded, ft_strlen(expanded));
+	write(fd, "\n", 1);
+	free(expanded);
+	return (0);
+}
+
+/*
+** Legge il contenuto di un heredoc gestendo delimiters multipli
+*/
+static int	read_heredoc_content(char *delimiter, int fd, char **other_delimiters, int delimiter_count)
+{
+	char	*line;
+	char	*clean_delimiter;
+	int		is_other_delimiter;
+	int		i;
+
+	// Rimuovi le quotes dal delimiter se presenti
+	clean_delimiter = process_token_quotes(delimiter);
+	if (!clean_delimiter)
+		return (-1);
+
+	while (1)
+	{
+		line = readline("> ");
+		if (!line)
+		{
+			ft_fprintf(2, "minishell: warning: here-document delimited by end-of-file (wanted `%s')\n", clean_delimiter);
+			break;
+		}
+		
+		// Controlla se è il nostro delimiter
+		if (ft_strncmp(line, clean_delimiter, ft_strlen(clean_delimiter)) == 0 
+			&& ft_strlen(line) == ft_strlen(clean_delimiter))
+		{
+			free(line);
+			break;
+		}
+		
+		// Controlla se è un altro delimiter (nel caso di heredoc multipli)
+		// In questo caso lo trattiamo come contenuto normale
+		is_other_delimiter = 0;
+		if (other_delimiters)
+		{
+			for (i = 0; i < delimiter_count; i++)
+			{
+				if (other_delimiters[i] && 
+					ft_strncmp(line, other_delimiters[i], ft_strlen(other_delimiters[i])) == 0 
+					&& ft_strlen(line) == ft_strlen(other_delimiters[i]))
+				{
+					// È un altro delimiter, ma lo scriviamo come contenuto
+					is_other_delimiter = 1;
+					break;
+				}
+			}
+		}
+		
+		if (expand_heredoc_line(line, fd, delimiter) == -1)
+		{
+			free(line);
+			free(clean_delimiter);
+			return (-1);
+		}
+		free(line);
+	}
+	
+	free(clean_delimiter);
+	return (0);
+}
+
+/*
+** Conta gli heredoc consecutivi in una sequenza di token
+*/
+static int	count_consecutive_heredocs(t_token *start)
+{
+	t_token	*current;
+	int		count;
+
+	count = 0;
+	current = start;
+	
+	while (current && current->type != TOKEN_PIPE)
+	{
+		if (current->type == TOKEN_HEREDOC)
+			count++;
+		current = current->next;
+	}
+	
+	return (count);
+}
+
+/*
+** Gestisce heredoc multipli come << EOF1 << EOF2
+*/
+static int	handle_multiple_heredocs(t_command *cmd, t_token *start_token)
+{
+	t_token		*current;
+	char		**delimiters;
+	char		**temp_files;
+	int			*fds;
+	int			count;
+	int			i;
+	int			final_fd;
+
+	count = count_consecutive_heredocs(start_token);
+	if (count == 0)
+		return (0);
+
+	// Alloca gli array necessari
+	delimiters = malloc(sizeof(char *) * count);
+	temp_files = malloc(sizeof(char *) * count);
+	fds = malloc(sizeof(int) * count);
+	
+	if (!delimiters || !temp_files || !fds)
+	{
+		free(delimiters);
+		free(temp_files);
+		free(fds);
+		return (-1);
+	}
+
+	// Inizializza gli array
+	for (i = 0; i < count; i++)
+	{
+		delimiters[i] = NULL;
+		temp_files[i] = NULL;
+		fds[i] = -1;
+	}
+
+	// Raccogli tutti i delimiters
+	i = 0;
+	current = start_token;
+	while (current && current->type != TOKEN_PIPE && i < count)
+	{
+		if (current->type == TOKEN_HEREDOC && current->next)
+		{
+			delimiters[i] = ft_strdup(current->next->value);
+			temp_files[i] = create_temp_filename();
+			if (!delimiters[i] || !temp_files[i])
+			{
+				// Cleanup
+				for (int j = 0; j <= i; j++)
+				{
+					free(delimiters[j]);
+					free(temp_files[j]);
+					if (fds[j] >= 0)
+						close(fds[j]);
+				}
+				free(delimiters);
+				free(temp_files);
+				free(fds);
+				return (-1);
+			}
+			i++;
+		}
+		current = current->next;
+	}
+
+	// Processa gli heredoc in ordine inverso (da destra a sinistra)
+	// Questo gestisce correttamente il caso << EOF1 << EOF2
+	for (i = count - 1; i >= 0; i--)
+	{
+		int write_fd = open(temp_files[i], O_CREAT | O_WRONLY | O_TRUNC, 0600);
+		if (write_fd == -1)
+		{
+			// Cleanup
+			for (int j = 0; j < count; j++)
+			{
+				free(delimiters[j]);
+				free(temp_files[j]);
+				if (fds[j] >= 0)
+					close(fds[j]);
+			}
+			free(delimiters);
+			free(temp_files);
+			free(fds);
+			return (-1);
+		}
+
+		// Leggi il contenuto dell'heredoc
+		// Passa gli altri delimiters per gestire il caso di nesting
+		if (read_heredoc_content(delimiters[i], write_fd, delimiters, count) == -1)
+		{
+			close(write_fd);
+			// Cleanup...
+			for (int j = 0; j < count; j++)
+			{
+				free(delimiters[j]);
+				free(temp_files[j]);
+				if (fds[j] >= 0)
+					close(fds[j]);
+			}
+			free(delimiters);
+			free(temp_files);
+			free(fds);
+			return (-1);
+		}
+
+		close(write_fd);
+
+		// Apri in lettura
+		fds[i] = open(temp_files[i], O_RDONLY);
+		unlink(temp_files[i]); // Rimuovi il file ma mantieni aperto il fd
+
+		if (fds[i] == -1)
+		{
+			// Cleanup...
+			for (int j = 0; j < count; j++)
+			{
+				free(delimiters[j]);
+				free(temp_files[j]);
+				if (fds[j] >= 0)
+					close(fds[j]);
+			}
+			free(delimiters);
+			free(temp_files);
+			free(fds);
+			return (-1);
+		}
+	}
+
+	// Il file descriptor finale è quello del primo heredoc (quello più a sinistra)
+	final_fd = fds[0];
+
+	// Chiudi tutti gli altri fd
+	for (i = 1; i < count; i++)
+	{
+		if (fds[i] >= 0)
+			close(fds[i]);
+	}
+
+	// Cleanup
+	for (i = 0; i < count; i++)
+	{
+		free(delimiters[i]);
+		free(temp_files[i]);
+	}
+	free(delimiters);
+	free(temp_files);
+	free(fds);
+
+	// Assegna il file descriptor al comando
+	if (cmd->in_fd >= 0)
+		close(cmd->in_fd);
+	cmd->in_fd = final_fd;
+
+	return (0);
+}
+
+/*
+** Gestisce un singolo heredoc
+*/
+static int	handle_single_heredoc(t_command *cmd, t_token *curr)
+{
+	char	*filename;
+	int		fd;
+
+	filename = create_temp_filename();
+	if (!filename)
+		return (-1);
+	
+	fd = open(filename, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+	if (fd == -1)
+	{
+		free(filename);
+		return (-1);
+	}
+	
+	if (read_heredoc_content(curr->next->value, fd, NULL, 0) == -1)
+	{
+		close(fd);
+		unlink(filename);
+		free(filename);
+		return (-1);
+	}
+	
+	close(fd);
+	
+	// Riapri in lettura
+	fd = open(filename, O_RDONLY);
+	unlink(filename);
+	free(filename);
+	
+	if (fd == -1)
+		return (-1);
+	
+	// Chiudi il precedente input fd se esiste
+	close_existing_fd(&cmd->in_fd);
+	cmd->in_fd = fd;
+	return (0);
+}
+
+/*
+** Gestisce le redirezioni di input (< e <<).
+** 
+** @param cmd: Il comando a cui applicare la redirezione
+** @param curr: Il token di redirezione corrente
+** @return: 0 se successo, -1 se errore
+*/
+static int	handle_input_redirection(t_command *cmd, t_token *curr)
+{
+	int	fd;
+
+	if (curr->type == TOKEN_HEREDOC)
+	{
+		// Controlla se ci sono heredoc multipli
+		int heredoc_count = count_consecutive_heredocs(curr);
+		if (heredoc_count > 1)
+			return (handle_multiple_heredocs(cmd, curr));
+		else
+			return (handle_single_heredoc(cmd, curr));
+	}
+	else
+	{
+		// Redirezione normale da file
+		close_existing_fd(&cmd->in_fd);
+		fd = open(curr->next->value, O_RDONLY);
+		if (fd == -1)
+		{
+			handle_file_error(curr->next->value);
+			return (-1);
+		}
+		cmd->in_fd = fd;
+	}
+	return (0);
+}
+
+/*
+** Gestisce le redirezioni di output (> e >>).
+** 
+** @param cmd: Il comando a cui applicare la redirezione
+** @param curr: Il token di redirezione corrente
+** @return: 0 se successo, -1 se errore
+*/
+static int	handle_output_redirection(t_command *cmd, t_token *curr)
+{
+	int	flags;
+	int	fd;
+
+	close_existing_fd(&cmd->out_fd);
+	flags = O_WRONLY | O_CREAT;
+	if (curr->type == TOKEN_APPEND)
+		flags |= O_APPEND;
+	else
+		flags |= O_TRUNC;
+	fd = open(curr->next->value, flags, 0644);
+	if (fd == -1)
+	{
+		handle_file_error(curr->next->value);
+		return (-1);
+	}
+	cmd->out_fd = fd;
+	return (0);
+}
+
+/*
+** Gestisce le redirezioni e aggiorna i file descriptor del comando.
+** 
+** @param cmd: Il comando a cui applicare le redirezioni
+** @param curr: Il token di redirezione corrente
+** @return: 0 se successo, -1 se errore
+*/
+int	handle_redirection(t_command *cmd, t_token *curr)
+{
+	if ((curr->type == TOKEN_REDIR_IN || curr->type == TOKEN_HEREDOC) && curr->next)
+	{
+		if (handle_input_redirection(cmd, curr) == -1)
+			return (-1);
+	}
+	else if ((curr->type == TOKEN_REDIR_OUT || curr->type == TOKEN_APPEND) && curr->next)
+	{
+		if (handle_output_redirection(cmd, curr) == -1)
+			return (-1);
+	}
+	return (0);
+}

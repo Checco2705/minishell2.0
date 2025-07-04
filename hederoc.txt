@@ -1,0 +1,349 @@
+# **************************************************************************** #
+#                                                                              #
+#                                                         :::      ::::::::    #
+#    hederoc.txt                                        :+:      :+:    :+:    #
+#                                                     +:+ +:+         +:+      #
+#    By: ffebbrar <ffebbrar@student.42.fr>          +#+  +:+       +#+         #
+#                                                 +#+#+#+#+#+   +#+            #
+#    Created: 2025/07/04 18:00:00 by ffebbrar          #+#    #+#              #
+#    Updated: 2025/07/04 23:54:43 by ffebbrar         ###   ########.fr        #
+#                                                                              #
+# **************************************************************************** #
+
+#include "minishell.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+
+typedef struct s_heredoc
+{
+	char				*delimiter;
+	int					fd;
+	struct s_heredoc	*next;
+}	t_heredoc;
+
+static char	*create_temp_filename(void)
+{
+	static int	counter = 0;
+	char		*num_str;
+	char		*filename;
+	char		*temp;
+
+	num_str = ft_itoa(counter++);
+	if (!num_str)
+		return (NULL);
+	temp = ft_strjoin("/tmp/heredoc_", num_str);
+	free(num_str);
+	if (!temp)
+		return (NULL);
+	num_str = ft_itoa(getpid());
+	if (!num_str)
+	{
+		free(temp);
+		return (NULL);
+	}
+	filename = ft_strjoin(temp, num_str);
+	free(temp);
+	free(num_str);
+	return (filename);
+}
+
+static int	expand_heredoc_line(char *line, int fd, char *delimiter)
+{
+	char	*expanded;
+	
+	// Se il delimiter è quotato, non espandere le variabili
+	if (ft_strchr(delimiter, '\'') || ft_strchr(delimiter, '"'))
+	{
+		write(fd, line, ft_strlen(line));
+		write(fd, "\n", 1);
+		return (0);
+	}
+	
+	// Espandi le variabili nella linea
+	expanded = expand_string(line);
+	if (!expanded)
+		return (-1);
+	
+	write(fd, expanded, ft_strlen(expanded));
+	write(fd, "\n", 1);
+	free(expanded);
+	return (0);
+}
+
+static int	read_heredoc_content(char *delimiter, int fd)
+{
+	char	*line;
+	char	*clean_delimiter;
+	int		len;
+
+	// Rimuovi le quotes dal delimiter se presenti
+	clean_delimiter = process_token_quotes(delimiter);
+	if (!clean_delimiter)
+		return (-1);
+
+	while (1)
+	{
+		line = readline("> ");
+		if (!line)
+		{
+			ft_fprintf(2, "minishell: warning: here-document delimited by end-of-file (wanted `%s')\n", clean_delimiter);
+			break;
+		}
+		
+		if (ft_strncmp(line, clean_delimiter, ft_strlen(clean_delimiter)) == 0 
+			&& ft_strlen(line) == ft_strlen(clean_delimiter))
+		{
+			free(line);
+			break;
+		}
+		
+		if (expand_heredoc_line(line, fd, delimiter) == -1)
+		{
+			free(line);
+			free(clean_delimiter);
+			return (-1);
+		}
+		free(line);
+	}
+	
+	free(clean_delimiter);
+	return (0);
+}
+
+static t_heredoc	*create_heredoc_node(char *delimiter)
+{
+	t_heredoc	*node;
+	char		*filename;
+
+	node = malloc(sizeof(t_heredoc));
+	if (!node)
+		return (NULL);
+	
+	node->delimiter = ft_strdup(delimiter);
+	if (!node->delimiter)
+	{
+		free(node);
+		return (NULL);
+	}
+	
+	filename = create_temp_filename();
+	if (!filename)
+	{
+		free(node->delimiter);
+		free(node);
+		return (NULL);
+	}
+	
+	node->fd = open(filename, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+	if (node->fd == -1)
+	{
+		free(filename);
+		free(node->delimiter);
+		free(node);
+		return (NULL);
+	}
+	
+	// Leggi il contenuto dell'heredoc
+	if (read_heredoc_content(delimiter, node->fd) == -1)
+	{
+		close(node->fd);
+		unlink(filename);
+		free(filename);
+		free(node->delimiter);
+		free(node);
+		return (NULL);
+	}
+	
+	close(node->fd);
+	
+	// Riapri in lettura
+	node->fd = open(filename, O_RDONLY);
+	unlink(filename); // Rimuovi il file, ma rimane aperto
+	free(filename);
+	
+	if (node->fd == -1)
+	{
+		free(node->delimiter);
+		free(node);
+		return (NULL);
+	}
+	
+	node->next = NULL;
+	return (node);
+}
+
+static void	free_heredoc_list(t_heredoc *list)
+{
+	t_heredoc	*current;
+	t_heredoc	*next;
+
+	current = list;
+	while (current)
+	{
+		next = current->next;
+		if (current->fd >= 0)
+			close(current->fd);
+		free(current->delimiter);
+		free(current);
+		current = next;
+	}
+}
+
+static t_heredoc	*collect_heredocs(t_token *tokens)
+{
+	t_heredoc	*head;
+	t_heredoc	*tail;
+	t_heredoc	*new_node;
+	t_token		*current;
+
+	head = NULL;
+	tail = NULL;
+	current = tokens;
+	
+	while (current)
+	{
+		if (current->type == TOKEN_HEREDOC && current->next)
+		{
+			new_node = create_heredoc_node(current->next->value);
+			if (!new_node)
+			{
+				free_heredoc_list(head);
+				return (NULL);
+			}
+			
+			if (!head)
+				head = new_node;
+			else
+				tail->next = new_node;
+			tail = new_node;
+		}
+		current = current->next;
+	}
+	
+	return (head);
+}
+
+static int	get_final_heredoc_fd(t_heredoc *heredocs)
+{
+	t_heredoc	*current;
+	int			final_fd;
+
+	if (!heredocs)
+		return (-1);
+	
+	current = heredocs;
+	final_fd = -1;
+	
+	// L'ultimo heredoc è quello che viene effettivamente usato
+	while (current)
+	{
+		if (final_fd >= 0)
+			close(final_fd); // Chiudi i precedenti
+		final_fd = dup(current->fd); // Duplica per mantenerlo aperto
+		current = current->next;
+	}
+	
+	return (final_fd);
+}
+
+int	handle_heredoc_redirection(t_command *cmd, t_token *curr)
+{
+	// Per il momento gestiamo un singolo heredoc
+	// La gestione multipla verrà fatta nella fase di parsing
+	char		*filename;
+	int			fd;
+
+	filename = create_temp_filename();
+	if (!filename)
+		return (-1);
+	
+	fd = open(filename, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+	if (fd == -1)
+	{
+		free(filename);
+		return (-1);
+	}
+	
+	if (read_heredoc_content(curr->next->value, fd) == -1)
+	{
+		close(fd);
+		unlink(filename);
+		free(filename);
+		return (-1);
+	}
+	
+	close(fd);
+	
+	// Riapri in lettura
+	fd = open(filename, O_RDONLY);
+	unlink(filename);
+	free(filename);
+	
+	if (fd == -1)
+		return (-1);
+	
+	// Chiudi il precedente input fd se esiste
+	if (cmd->in_fd >= 0)
+		close(cmd->in_fd);
+	
+	cmd->in_fd = fd;
+	return (0);
+}
+
+// Funzione per processare tutti gli heredoc in una pipeline
+int	process_pipeline_heredocs(t_command *commands)
+{
+	t_command	*current;
+	t_token		*tokens;
+	t_heredoc	*heredocs;
+	int			final_fd;
+
+	current = commands;
+	while (current)
+	{
+		// Qui dovresti avere accesso ai token originali del comando
+		// Per ora gestiamo caso per caso nel parsing normale
+		current = current->next;
+	}
+	return (0);
+}
+
+// Aggiorna la funzione handle_redirection esistente
+int	handle_redirection_with_heredoc(t_command *cmd, t_token *curr)
+{
+	if (curr->type == TOKEN_HEREDOC && curr->next)
+		return (handle_heredoc_redirection(cmd, curr));
+	else if (curr->type == TOKEN_REDIR_IN && curr->next)
+	{
+		// Gestione normale del redirect input
+		if (cmd->in_fd >= 0)
+			close(cmd->in_fd);
+		cmd->in_fd = open(curr->next->value, O_RDONLY);
+		if (cmd->in_fd == -1)
+		{
+			perror("minishell");
+			return (-1);
+		}
+	}
+	else if ((curr->type == TOKEN_REDIR_OUT || curr->type == TOKEN_APPEND) && curr->next)
+	{
+		// Gestione normale del redirect output
+		int flags = O_WRONLY | O_CREAT;
+		if (curr->type == TOKEN_APPEND)
+			flags |= O_APPEND;
+		else
+			flags |= O_TRUNC;
+			
+		if (cmd->out_fd >= 0)
+			close(cmd->out_fd);
+		cmd->out_fd = open(curr->next->value, flags, 0644);
+		if (cmd->out_fd == -1)
+		{
+			perror("minishell");
+			return (-1);
+		}
+	}
+	
+	return (0);
+}

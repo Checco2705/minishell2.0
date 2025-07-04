@@ -1,0 +1,186 @@
+# **************************************************************************** #
+#                                                                              #
+#                                                         :::      ::::::::    #
+#    test_hederoc.txt                                   :+:      :+:    :+:    #
+#                                                     +:+ +:+         +:+      #
+#    By: ffebbrar <ffebbrar@student.42.fr>          +#+  +:+       +#+         #
+#                                                 +#+#+#+#+#+   +#+            #
+#    Created: 2025/07/04 19:00:00 by ffebbrar          #+#    #+#              #
+#    Updated: 2025/07/04 23:56:32 by ffebbrar         ###   ########.fr        #
+#                                                                              #
+# **************************************************************************** #
+
+#include "minishell.h"
+
+/*
+** Test cases per verificare la corretta implementazione degli heredoc
+** 
+** Test 1: Heredoc semplice
+** cat << EOF
+** hello
+** world
+** EOF
+** 
+** Test 2: Heredoc multipli (come nel tuo esempio)
+** cat << EOF1 << EOF2
+** content for EOF2
+** EOF2
+** content for EOF1
+** EOF1
+** 
+** Test 3: Heredoc con espansione variabili
+** cat << EOF
+** Hello $USER
+** Today is $(date)
+** EOF
+** 
+** Test 4: Heredoc con delimiter quotato (no espansione)
+** cat << 'EOF'
+** Hello $USER
+** Today is $(date)
+** EOF
+*/
+
+void test_heredoc_simple(void)
+{
+    printf("=== Test Heredoc Semplice ===\n");
+    printf("Simula: cat << EOF\n");
+    
+    // Questo test simula il parsing e l'esecuzione
+    char *input = "cat << EOF";
+    t_command *commands = parse_input(input);
+    
+    if (commands)
+    {
+        printf("Comando parsato correttamente\n");
+        printf("Tipo redirezione: %s\n", 
+               commands->in_fd >= 0 ? "HEREDOC" : "NONE");
+        free_commands(commands);
+    }
+    else
+    {
+        printf("Errore nel parsing\n");
+    }
+}
+
+void test_heredoc_multiple(void)
+{
+    printf("\n=== Test Heredoc Multipli ===\n");
+    printf("Simula: cat << EOF1 << EOF2\n");
+    
+    char *input = "cat << EOF1 << EOF2";
+    t_command *commands = parse_input(input);
+    
+    if (commands)
+    {
+        printf("Comando con heredoc multipli parsato correttamente\n");
+        printf("Input FD: %d\n", commands->in_fd);
+        free_commands(commands);
+    }
+    else
+    {
+        printf("Errore nel parsing heredoc multipli\n");
+    }
+}
+
+void test_heredoc_with_variables(void)
+{
+    printf("\n=== Test Heredoc con Variabili ===\n");
+    printf("Simula: cat << EOF con $USER\n");
+    
+    // Imposta una variabile di test
+    ft_setenv("USER", "testuser", 1);
+    
+    char *input = "cat << EOF";
+    t_command *commands = parse_input(input);
+    
+    if (commands)
+    {
+        printf("Heredoc con variabili parsato correttamente\n");
+        free_commands(commands);
+    }
+}
+
+void test_heredoc_quoted_delimiter(void)
+{
+    printf("\n=== Test Heredoc con Delimiter Quotato ===\n");
+    printf("Simula: cat << 'EOF'\n");
+    
+    char *input = "cat << 'EOF'";
+    t_command *commands = parse_input(input);
+    
+    if (commands)
+    {
+        printf("Heredoc con delimiter quotato parsato correttamente\n");
+        free_commands(commands);
+    }
+}
+
+// Funzione di test principale
+int main_test_heredoc(void)
+{
+    printf("Inizio test implementazione heredoc\n");
+    printf("====================================\n");
+    
+    // Inizializza il sistema
+    setup_signals();
+    
+    // Esegui i test
+    test_heredoc_simple();
+    test_heredoc_multiple();
+    test_heredoc_with_variables();
+    test_heredoc_quoted_delimiter();
+    
+    printf("\n====================================\n");
+    printf("Test completati\n");
+    
+    return 0;
+}
+
+/*
+** Esempi di uso degli heredoc che dovrebbero funzionare:
+** 
+** 1. Caso base:
+** cat << EOF
+** hello world
+** EOF
+** 
+** 2. Caso multiplo (il tuo esempio):
+** cat << EOF1 << EOF2 
+** dww
+** awd
+** EOF2
+** wd
+** adw
+** EOF1
+** 
+** Output dovrebbe essere:
+** wd
+** adw
+** EOF1
+** wd
+** adw
+** 
+** 3. Con pipe:
+** cat << EOF | grep hello
+** hello world
+** goodbye world
+** EOF
+** 
+** 4. Con redirezione output:
+** cat << EOF > output.txt
+** content here
+** EOF
+** 
+** 5. Con espansione variabili:
+** cat << EOF
+** Current user: $USER
+** Home directory: $HOME
+** Last exit status: $?
+** EOF
+** 
+** 6. Senza espansione (delimiter quotato):
+** cat << 'EOF'
+** This $USER will not be expanded
+** EOF
+*/
